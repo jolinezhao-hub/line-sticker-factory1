@@ -1,218 +1,390 @@
-
-import os, io, json, base64, zipfile
+import io
+import os
+import json
+import base64
+import zipfile
 from pathlib import Path
+
+import requests
+from PIL import Image
 import streamlit as st
-from PIL import Image, ImageDraw
 
-st.set_page_config(page_title="LINE Sticker Factory", page_icon="🎨", layout="centered")
 
-st.markdown("""
-<style>
-.block-container {max-width:760px;padding:1rem 1rem 3rem}
-.stButton>button,.stDownloadButton>button{width:100%;min-height:50px;border-radius:14px;font-size:1.05rem}
-.stTextArea textarea,.stTextInput input{font-size:16px}
-</style>
-""", unsafe_allow_html=True)
+APP_TITLE = "🎨 LINE Sticker Factory v0.6"
+API_BASE = "https://gen.pollinations.ai"
+TEXT_MODEL = os.getenv("POLLINATIONS_TEXT_MODEL", "openai")
+IMAGE_MODEL = os.getenv("POLLINATIONS_IMAGE_MODEL", "kontext")
 
-BASE = Path(".")
-WORK = BASE / "sticker_projects"
-ASSETS = WORK / "assets"
-WORK.mkdir(exist_ok=True)
-ASSETS.mkdir(exist_ok=True)
+SCENARIOS = {
+    "上班日常": "職場、工作、上班、疲累、回覆同事、加班、下班等日常。",
+    "情侶互動": "情侶之間的撒嬌、想念、關心、道歉、等待、約會與甜蜜互動。",
+    "朋友聊天": "朋友聊天、吐槽、安慰、邀約、已讀、驚訝、開心與日常回覆。",
+    "搞笑吐槽": "誇張反應、吐槽、崩潰、無言、傻眼、得意、搞笑日常。",
+    "可愛撒嬌": "可愛、撒嬌、害羞、求抱抱、想你、謝謝、拜託、晚安等。",
+    "生活日常": "吃飯、睡覺、出門、回家、天氣、購物、休息、開心與小情緒。",
+    "自訂情境": "",
+}
 
-def sticker_plan(quantity):
-    base = [
-        ("早安","sleepy_happy","wave"),
-        ("收到","calm","salute"),
-        ("好累","exhausted","slump"),
-        ("辛苦了","warm","thumbs_up"),
-        ("傻眼","speechless","blank_stare"),
-        ("不想上班","despair","hide_under_blanket"),
-        ("下班啦","excited","run_out"),
-        ("晚安","sleepy","sleep"),
-    ]
-    return [
-        {"id":f"{i+1:03d}","text":base[i % 8][0],
-         "emotion":base[i % 8][1],"action":base[i % 8][2]}
-        for i in range(quantity)
-    ]
+DEFAULT_LINES = [
+    "早安",
+    "收到！",
+    "等一下啦",
+    "我懂你",
+    "辛苦了",
+    "哈哈哈哈",
+    "謝謝你",
+    "晚安",
+]
 
-def character_bible():
-    return {
-        "name":"主角",
-        "reference":"user_uploaded_reference",
-        "visual_identity":"沿用使用者上傳的主角圖片，不重新設計角色",
-        "rules":[
-            "保持原始髮型、圓框眼鏡、臉型、身形、服裝識別特徵",
-            "保持可愛、圓潤、chibi 角色比例",
-            "每張貼圖只出現主角",
-            "不要擅自更換角色外觀"
-        ]
-    }
 
-def make_prompt(c, s):
-    return f"""Create one polished LINE sticker featuring the SAME character shown in the supplied reference image.
+def get_api_key():
+    try:
+        return st.secrets["POLLINATIONS_API_KEY"]
+    except Exception:
+        return os.getenv("POLLINATIONS_API_KEY", "")
 
-CHARACTER:
-Use the uploaded reference image as the primary character identity.
-Preserve the exact recognizable hairstyle, round glasses, face proportions,
-body proportions, clothing identity and overall cute chibi appearance.
 
-STICKER:
-Traditional Chinese text: 「{s['text']}」
-Emotion: {s['emotion']}
-Action: {s['action']}
-
-COMPOSITION:
-Single character, expressive pose, clear silhouette, centered composition,
-large readable Traditional Chinese text, transparent background, clean sticker artwork.
-
-DO NOT:
-redesign the character, change hairstyle, remove glasses, add another person,
-add watermark, logo, busy background, or photorealistic human styling.
-"""
-
-def generate_openai(prompt, reference_path, output):
-    from openai import OpenAI
-    key = os.getenv("OPENAI_API_KEY")
+def call_text_ai(user_prompt: str):
+    key = get_api_key()
     if not key:
-        raise RuntimeError("尚未設定 OPENAI_API_KEY")
+        raise RuntimeError("找不到 POLLINATIONS_API_KEY。請在 Streamlit Secrets 設定。")
 
-    client = OpenAI(api_key=key)
-    model = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-2")
+    payload = {
+        "model": TEXT_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你是 LINE 貼圖腳本企劃。"
+                    "請使用繁體中文。每格必須短、自然、像聊天訊息。"
+                    "不要寫長句，不要加入不必要的旁白。"
+                    "輸出嚴格 JSON，格式為 {\"stickers\":[{\"index\":1,\"text\":\"...\","
+                    "\"action\":\"...\",\"expression\":\"...\",\"scene\":\"...\"}]}。"
+                ),
+            },
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.8,
+    }
+    r = requests.post(
+        f"{API_BASE}/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=120,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"腳本 AI 回應 {r.status_code}: {r.text[:600]}")
+    data = r.json()
+    content = data["choices"][0]["message"]["content"]
+    return parse_scripts(content)
 
-    with open(reference_path, "rb") as f:
-        result = client.images.edit(model=model, image=f, prompt=prompt)
 
-    item = result.data[0]
-    b64 = getattr(item, "b64_json", None)
-    if not b64:
-        raise RuntimeError("圖片 API 沒有回傳 b64_json")
-    output.write_bytes(base64.b64decode(b64))
+def parse_scripts(content: str):
+    content = content.strip()
+    if content.startswith("```"):
+        content = content.replace("```json", "").replace("```", "").strip()
+    try:
+        obj = json.loads(content)
+        items = obj.get("stickers", [])
+        if items:
+            return normalize_scripts(items)
+    except Exception:
+        pass
 
-def process_image(src, dst):
-    img = Image.open(src).convert("RGBA")
-    alpha = img.getchannel("A")
-    bbox = alpha.getbbox()
-    if bbox:
-        img = img.crop(bbox)
-    img.thumbnail((322,272), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGBA",(370,320),(255,255,255,0))
-    canvas.alpha_composite(img,((370-img.width)//2,(320-img.height)//2))
-    canvas.save(dst,"PNG",optimize=True)
+    # Fallback: try to locate the JSON object inside extra prose.
+    start = content.find("{")
+    end = content.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = json.loads(content[start:end + 1])
+            items = obj.get("stickers", [])
+            if items:
+                return normalize_scripts(items)
+        except Exception:
+            pass
 
-def make_preview(files, output):
-    cols, cell_w, cell_h = 4, 370, 350
-    rows = (len(files)+cols-1)//cols
-    canvas = Image.new("RGB",(cols*cell_w,rows*cell_h),"white")
-    draw = ImageDraw.Draw(canvas)
-    for i,f in enumerate(files):
-        img = Image.open(f).convert("RGBA")
-        bg = Image.new("RGBA",img.size,"white")
-        bg.alpha_composite(img)
-        bg=bg.convert("RGB")
-        img.thumbnail((370,320))
-        x=(i%cols)*cell_w; y=(i//cols)*cell_h
-        canvas.paste(img,(x,y))
-        draw.text((x+8,y+325),f.stem,fill="black")
-    canvas.save(output,"PNG")
+    # Last fallback: provide editable starter scripts rather than failing the whole app.
+    return normalize_scripts([
+        {"index": i + 1, "text": DEFAULT_LINES[i % len(DEFAULT_LINES)],
+         "action": "自然的聊天動作", "expression": "可愛自然", "scene": "簡潔乾淨背景"}
+        for i in range(8)
+    ])
 
-st.title("🎨 LINE Sticker Factory")
-st.caption("手機版 · 一句話 → AI 貼圖")
+
+def normalize_scripts(items):
+    out = []
+    for i, item in enumerate(items):
+        out.append({
+            "index": i + 1,
+            "text": str(item.get("text", DEFAULT_LINES[i % len(DEFAULT_LINES)]))[:30],
+            "action": str(item.get("action", "自然的聊天動作"))[:80],
+            "expression": str(item.get("expression", "可愛自然"))[:50],
+            "scene": str(item.get("scene", "簡潔乾淨背景"))[:80],
+        })
+    return out
+
+
+def build_script_prompt(scenario_name, scenario_desc, idea, count, character_note):
+    return f"""
+請根據以下需求，設計 {count} 格 LINE 貼圖腳本。
+
+情境：{scenario_name}
+情境補充：{scenario_desc}
+使用者的一句話：{idea}
+主角設定：{character_note}
+
+規則：
+1. 每格是可以直接放在 LINE 貼圖上的繁體中文短台詞，最好 2～10 個字。
+2. {count} 格要有明顯不同的情緒、動作或使用時機，不要只是同義改寫。
+3. 腳本要像真實聊天會使用的回覆。
+4. action 寫主角的肢體動作；expression 寫表情；scene 寫極簡背景。
+5. 主角永遠是同一位上傳角色，不新增第二個主要人物。
+6. 不要寫圖片生成提示詞，不要寫教學，不要加 Markdown。
+7. 嚴格只輸出 JSON。
+""".strip()
+
+
+def image_edit(reference_bytes, prompt):
+    key = get_api_key()
+    if not key:
+        raise RuntimeError("找不到 POLLINATIONS_API_KEY。請在 Streamlit Secrets 設定。")
+
+    files = {
+        "image": ("character.png", reference_bytes, "image/png"),
+    }
+    data = {
+        "model": IMAGE_MODEL,
+        "prompt": prompt,
+        "size": "1024x1024",
+    }
+    r = requests.post(
+        f"{API_BASE}/v1/images/edits",
+        headers={"Authorization": f"Bearer {key}"},
+        files=files,
+        data=data,
+        timeout=240,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"圖片 AI 回應 {r.status_code}: {r.text[:800]}")
+
+    result = r.json()
+    item = result.get("data", [{}])[0]
+
+    if item.get("b64_json"):
+        return base64.b64decode(item["b64_json"])
+
+    if item.get("url"):
+        rr = requests.get(
+            item["url"],
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=120,
+        )
+        rr.raise_for_status()
+        return rr.content
+
+    raise RuntimeError("圖片 API 沒有回傳可用的圖片資料。")
+
+
+def make_image_prompt(script, scenario_name, character_note):
+    return f"""
+Create ONE LINE sticker image using the uploaded reference character as the same main character.
+
+CHARACTER LOCK:
+{character_note}
+
+SCENE:
+Scenario: {scenario_name}
+Sticker text: "{script['text']}"
+Action: {script['action']}
+Expression: {script['expression']}
+Minimal background: {script['scene']}
+
+VISUAL RULES:
+- Keep the uploaded character's identity, hairstyle, glasses, face shape, body proportions and clothing identity consistent.
+- Cute chibi sticker illustration, clean readable silhouette, expressive pose.
+- ONE main character only. No second person.
+- Traditional Chinese sticker text exactly: "{script['text']}"
+- Make the text large, clear, centered and readable, with enough contrast.
+- Clean sticker composition, simple or transparent-looking background, no watermark, no logo, no photorealistic human, no busy scenery.
+- Do not redesign the character.
+- The whole character and text should fit comfortably inside the canvas.
+""".strip()
+
+
+def process_for_line(raw_bytes):
+    img = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
+    max_w, max_h = 370, 320
+    scale = min(max_w / img.width, max_h / img.height, 1.0)
+    new_size = (max(1, int(img.width * scale)), max(1, int(img.height * scale)))
+    img = img.resize(new_size, Image.LANCZOS)
+
+    canvas = Image.new("RGBA", (max_w, max_h), (255, 255, 255, 0))
+    x = (max_w - img.width) // 2
+    y = (max_h - img.height) // 2
+    canvas.alpha_composite(img, (x, y))
+    out = io.BytesIO()
+    canvas.save(out, format="PNG")
+    return out.getvalue()
+
+
+def qa_image(png_bytes):
+    img = Image.open(io.BytesIO(png_bytes))
+    checks = {
+        "PNG": img.format == "PNG",
+        "尺寸": img.size == (370, 320),
+        "RGBA": img.mode == "RGBA",
+        "檔案大小 < 1 MB": len(png_bytes) < 1024 * 1024,
+    }
+    return checks
+
+
+def zip_outputs(items):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for idx, data in items:
+            z.writestr(f"sticker_{idx:02d}.png", data)
+        manifest = {
+            "app": "LINE Sticker Factory v0.6",
+            "count": len(items),
+            "files": [f"sticker_{idx:02d}.png" for idx, _ in items],
+        }
+        z.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    return out.getvalue()
+
+
+st.set_page_config(page_title=APP_TITLE, page_icon="🎨", layout="centered")
+st.title(APP_TITLE)
+st.caption("一句話 → 選情境 → AI 寫腳本 → 固定使用你的主角 → 生成貼圖 → 預覽與下載")
+
+if "scripts" not in st.session_state:
+    st.session_state.scripts = []
+if "generated" not in st.session_state:
+    st.session_state.generated = []
+if "character_bytes" not in st.session_state:
+    st.session_state.character_bytes = None
+
+with st.expander("ℹ️ 這一版的核心流程", expanded=True):
+    st.write("你不需要自己一張一張想台詞。先告訴 AI「想表達什麼」，再選一個情境，AI 會自動規劃一整套貼圖腳本。")
 
 st.subheader("① 上傳主角")
-uploaded = st.file_uploader("主角參考圖片", type=["png","jpg","jpeg","webp"])
+uploaded = st.file_uploader("上傳你的主角參考圖", type=["png", "jpg", "jpeg"])
 if uploaded:
-    ref = ASSETS / "reference_character.png"
-    ref.write_bytes(uploaded.getbuffer())
-    st.image(uploaded, caption="目前主角參考圖", use_container_width=True)
-else:
-    ref = ASSETS / "reference_character.png"
-    if ref.exists():
-        st.image(str(ref), caption="目前主角參考圖", use_container_width=True)
+    st.session_state.character_bytes = uploaded.getvalue()
+if st.session_state.character_bytes:
+    st.image(st.session_state.character_bytes, caption="目前固定使用的主角", width=180)
 
-st.subheader("② 貼圖需求")
-idea = st.text_area("一句話描述", "可愛厭世上班族角色", height=90)
-quantity = st.selectbox("張數", [8,16,24,40], index=0)
+character_note = st.text_area(
+    "角色設定（可選）",
+    value="可愛 Q 版女孩；以我上傳的參考圖為最高優先，保持髮型、圓框眼鏡、臉型、眼睛、服裝與整體比例一致。",
+    height=90,
+)
 
-if st.button("🚀 開始製作", type="primary"):
-    if not ref.exists():
-        st.error("請先上傳主角圖片。")
-        st.stop()
+st.subheader("② 選擇情境")
+scenario = st.selectbox("這一套貼圖主要用在哪裡？", list(SCENARIOS.keys()))
+scenario_desc = SCENARIOS[scenario]
+if scenario == "自訂情境":
+    scenario_desc = st.text_area("請描述你的情境", placeholder="例如：家人群組、寵物主人日常、客服回覆……")
 
-    project = WORK / "current"
-    generated = project/"generated"
-    processed = project/"processed"
-    delivery = project/"delivery"
-    for d in [generated,processed,delivery]:
-        d.mkdir(parents=True,exist_ok=True)
+st.subheader("③ 告訴 AI 你想表達什麼")
+idea = st.text_area(
+    "用一句話描述",
+    placeholder="例如：最近工作好多，每天都好累，但又要假裝自己沒事",
+    height=100,
+)
 
-    bible = character_bible()
-    stickers = sticker_plan(quantity)
-    prompts = [dict(s, prompt=make_prompt(bible,s)) for s in stickers]
+st.subheader("④ 貼圖數量")
+count = st.radio("數量", [8, 16, 24], horizontal=True, index=0)
 
-    (project/"project.json").write_text(json.dumps({
-        "theme":idea,"quantity":quantity,"language":"zh-TW"
-    },ensure_ascii=False,indent=2),encoding="utf-8")
-    (project/"character.json").write_text(json.dumps(bible,ensure_ascii=False,indent=2),encoding="utf-8")
-    (project/"sticker_list.json").write_text(json.dumps(stickers,ensure_ascii=False,indent=2),encoding="utf-8")
-    (project/"prompts.json").write_text(json.dumps(prompts,ensure_ascii=False,indent=2),encoding="utf-8")
+if st.button("✨ 自動寫劇本", type="primary", use_container_width=True):
+    if not st.session_state.character_bytes:
+        st.error("請先上傳主角參考圖。")
+    elif not idea.strip():
+        st.error("請先輸入一句話。")
+    else:
+        with st.spinner("AI 正在依照情境規劃整套腳本……"):
+            try:
+                st.session_state.scripts = call_text_ai(
+                    build_script_prompt(scenario, scenario_desc, idea, count, character_note)
+                )
+                st.session_state.generated = []
+                st.success(f"已產生 {len(st.session_state.scripts)} 格腳本。你可以先修改台詞，再生成圖片。")
+            except Exception as e:
+                st.error(str(e))
 
-    try:
-        with st.status("正在製作…", expanded=True) as status:
-            progress = st.progress(0)
-            for i,item in enumerate(prompts):
-                out = generated/f"{item['id']}.png"
-                if not out.exists():
-                    st.write(f"🎨 生成 {item['id']}｜{item['text']}")
-                    generate_openai(item["prompt"],ref,out)
-                progress.progress((i+1)/len(prompts))
+if st.session_state.scripts:
+    st.subheader("⑤ AI 劇本（可直接修改）")
+    st.caption("先把台詞改成你真正想用的版本，再按下面的按鈕生成圖片。")
 
-            st.write("✂️ 圖片處理")
-            for f in sorted(generated.glob("*.png")):
-                process_image(f,processed/f.name)
+    edited = []
+    for i, s in enumerate(st.session_state.scripts):
+        with st.container(border=True):
+            st.markdown(f"**第 {i+1} 格**")
+            text = st.text_input("台詞", s["text"], key=f"text_{i}")
+            c1, c2 = st.columns(2)
+            with c1:
+                action = st.text_input("動作", s["action"], key=f"action_{i}")
+            with c2:
+                expression = st.text_input("表情", s["expression"], key=f"expr_{i}")
+            scene = st.text_input("簡單背景", s["scene"], key=f"scene_{i}")
+            edited.append({
+                "index": i + 1,
+                "text": text,
+                "action": action,
+                "expression": expression,
+                "scene": scene,
+            })
+    st.session_state.scripts = edited
 
-            st.write("🔍 QA")
-            files=sorted(processed.glob("*.png"))
-            issues=[]
-            for f in files:
-                try:
-                    with Image.open(f) as im:
-                        if im.mode!="RGBA": issues.append(f"{f.name}: mode")
-                        if im.size!=(370,320): issues.append(f"{f.name}: size")
-                except Exception as e:
-                    issues.append(f"{f.name}: corrupt")
-                if f.stat().st_size>1_000_000: issues.append(f"{f.name}: too large")
-            if len(files)!=quantity: issues.append("sticker count mismatch")
-            if issues:
-                status.update(label="QA 未通過",state="error")
-                st.error("有問題："+", ".join(issues))
-                st.stop()
+    if st.button("🎨 開始製作貼圖", type="primary", use_container_width=True):
+        st.session_state.generated = []
+        total = len(st.session_state.scripts)
+        progress = st.progress(0)
+        for i, script in enumerate(st.session_state.scripts):
+            try:
+                prompt = make_image_prompt(script, scenario, character_note)
+                raw = image_edit(st.session_state.character_bytes, prompt)
+                processed = process_for_line(raw)
+                qa = qa_image(processed)
+                st.session_state.generated.append({
+                    "index": i + 1,
+                    "text": script["text"],
+                    "data": processed,
+                    "qa": qa,
+                })
+                progress.progress((i + 1) / total)
+            except Exception as e:
+                st.session_state.generated.append({
+                    "index": i + 1,
+                    "text": script["text"],
+                    "data": None,
+                    "qa": {"錯誤": str(e)},
+                })
+                progress.progress((i + 1) / total)
 
-            st.write("📦 打包")
-            preview=delivery/"preview.png"
-            make_preview(files,preview)
-            for f in files:
-                target=delivery/f"sticker_{f.stem}.png"
-                target.write_bytes(f.read_bytes())
+if st.session_state.generated:
+    st.subheader("⑥ 預覽與 QA")
+    good_items = []
+    for item in st.session_state.generated:
+        with st.container(border=True):
+            st.markdown(f"**{item['index']:02d}｜{item['text']}**")
+            if item["data"]:
+                st.image(item["data"], width=260)
+                qa = item["qa"]
+                st.write("、".join([f"{k}: {'✅' if v else '❌'}" for k, v in qa.items()]))
+                if all(qa.values()):
+                    good_items.append((item["index"], item["data"]))
+            else:
+                st.error(item["qa"].get("錯誤", "未知錯誤"))
 
-            metadata={"theme":idea,"quantity":quantity,"status":"PASS"}
-            (delivery/"metadata.json").write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding="utf-8")
-
-            package=delivery/"LINE_Sticker_Package.zip"
-            with zipfile.ZipFile(package,"w",zipfile.ZIP_DEFLATED) as z:
-                for f in delivery.iterdir():
-                    if f.is_file() and f!=package:
-                        z.write(f,f.name)
-            status.update(label="完成！",state="complete")
-
-        st.success(f"🎉 {quantity} 張貼圖完成")
-        st.image(str(preview),caption="整套預覽",use_container_width=True)
-        st.download_button("📦 下載完整素材包",package.read_bytes(),
-                           file_name="LINE_Sticker_Package.zip",mime="application/zip")
-    except Exception as e:
-        st.error("製作失敗：請確認部署平台已設定 OPENAI_API_KEY。")
-        st.exception(e)
+    if good_items:
+        zip_bytes = zip_outputs(good_items)
+        st.download_button(
+            "📦 下載 LINE 貼圖 ZIP",
+            data=zip_bytes,
+            file_name="line-stickers-v0.6.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
 
 st.divider()
-st.caption("LINE Sticker Factory Mobile v0.4")
+st.caption("本版本使用 Pollinations API。API 生成需要 API key，圖片/文字生成會消耗 Pollen；免費 Quest Pollen 是否可用取決於你的帳戶與當時活動。")
